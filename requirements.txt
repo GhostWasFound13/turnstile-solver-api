@@ -1,8 +1,5 @@
 quart
-asyncio
-argparse
-patchright
-camoufox[geoip]
-requests
+selenium
 aiosqlite
 rich
+browserforge
