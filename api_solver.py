@@ -318,18 +318,37 @@ class TurnstileAPIServer:
         
         firefox_options.add_argument("--no-sandbox")
         firefox_options.add_argument("--disable-dev-shm-usage")
+        
+        # MEMORY OPTIMIZATION PREFERENCES
         firefox_options.set_preference("dom.webdriver.enabled", False)
         firefox_options.set_preference("useAutomationExtension", False)
         firefox_options.set_preference("media.navigator.enabled", False)
         firefox_options.set_preference("javascript.enabled", True)
-        firefox_options.set_preference("permissions.default.image", 2)
-        firefox_options.set_preference("dom.ipc.processCount", 1)
+        firefox_options.set_preference("permissions.default.image", 2)  # Block images
+        firefox_options.set_preference("dom.ipc.processCount", 1)  # Reduce processes
         firefox_options.set_preference("browser.tabs.remote.autostart", False)
         firefox_options.set_preference("browser.tabs.remote.autostart.2", False)
         firefox_options.set_preference("browser.tabs.remote.separatePrivilegedContentProcess", False)
         firefox_options.set_preference("browser.tabs.remote.separatePrivilegedMozillaWebContentProcess", False)
         firefox_options.set_preference("browser.tabs.remote.separateFileUriProcess", False)
-        firefox_options.set_preference("browser.tabs.remote.separatePrivilegedContentProcess", False)
+        firefox_options.set_preference("browser.sessionhistory.max_entries", 5)
+        firefox_options.set_preference("browser.sessionhistory.contentViewerTimeout", 0)
+        firefox_options.set_preference("browser.cache.memory.enable", False)
+        firefox_options.set_preference("browser.cache.disk.enable", False)
+        firefox_options.set_preference("browser.cache.offline.enable", False)
+        firefox_options.set_preference("browser.shell.checkDefaultBrowser", False)
+        firefox_options.set_preference("browser.startup.page", 0)
+        firefox_options.set_preference("browser.privatebrowsing.autostart", True)
+        firefox_options.set_preference("network.http.max-connections", 6)
+        firefox_options.set_preference("network.http.max-persistent-connections-per-server", 2)
+        firefox_options.set_preference("dom.disable_beforeunload", True)
+        firefox_options.set_preference("dom.push.enabled", False)
+        firefox_options.set_preference("datareporting.healthreport.uploadEnabled", False)
+        firefox_options.set_preference("toolkit.telemetry.enabled", False)
+        firefox_options.set_preference("extensions.enabledScopes", 0)
+        firefox_options.set_preference("extensions.autoDisableScopes", 0)
+        firefox_options.set_preference("extensions.enabled", False)
+        
         firefox_options.binary_location = "/usr/bin/firefox-esr"
         
         if self.useragent:
@@ -346,15 +365,18 @@ class TurnstileAPIServer:
         for path in geckodriver_paths:
             if os.path.exists(path):
                 logger.info(f"Using GeckoDriver: {path}")
-                service = Service(executable_path=path)
+                service = Service(executable_path=path, log_output=os.devnull)
                 break
         
         if not service:
-            service = Service()
+            service = Service(log_output=os.devnull)
         
         for i in range(self.thread_count):
             try:
                 driver = webdriver.Firefox(options=firefox_options, service=service)
+                # Set page load timeout
+                driver.set_page_load_timeout(30)
+                driver.set_script_timeout(30)
                 await self.driver_pool.put((i+1, driver))
                 if self.debug:
                     logger.info(f"GeckoDriver {i + 1} initialized successfully")
@@ -482,11 +504,14 @@ class TurnstileAPIServer:
             logger.debug(f"Browser {index}: Created CAPTCHA overlay with sitekey: {websiteKey}")
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None, request_proxy: Optional[str] = None):
+        logger.info(f"🚀 SOLVER STARTED for task {task_id}")
         async with self.semaphore:
+            logger.info(f"🔒 Acquired semaphore for task {task_id}")
             proxy = None
 
             try:
                 index, driver = await asyncio.wait_for(self.driver_pool.get(), timeout=30.0)
+                logger.info(f"📱 Got driver {index} for task {task_id}")
             except asyncio.TimeoutError:
                 logger.error(f"Task {task_id}: Timeout waiting for driver")
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
@@ -522,16 +547,15 @@ class TurnstileAPIServer:
                 return
 
             try:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey}")
-
+                logger.info(f"🌐 Browser {index}: Loading URL: {url}")
                 driver.get(url)
+                logger.info(f"✅ Browser {index}: Page loaded")
 
                 try:
                     login_input = driver.find_elements(By.CSS_SELECTOR, 'input[name="address"]')
                     if self.login_address and login_input:
                         if self.debug:
-                            logger.debug(f"Browser {index}: Login page detected, submitting configured TURNSTILE_LOGIN_ADDRESS")
+                            logger.debug(f"Browser {index}: Login page detected")
                         
                         login_input[0].send_keys(self.login_address)
                         time.sleep(0.5)
@@ -541,37 +565,13 @@ class TurnstileAPIServer:
                             submit_btn[0].click()
                         
                         if self.debug:
-                            logger.debug(f"Browser {index}: Login submitted, waiting for verification page")
+                            logger.debug(f"Browser {index}: Login submitted")
                         time.sleep(2)
                 except Exception as e:
                     if self.debug:
-                        logger.debug(f"Browser {index}: Optional login flow info: {e}")
+                        logger.debug(f"Browser {index}: Login flow: {e}")
 
-                try:
-                    buttons = [
-                        '#load-turnstile-btn',
-                        'button:has-text("Load Security Verification")',
-                        'button:has-text("Click to verify")',
-                        '.btn-primary-modern:has-text("Security")'
-                    ]
-                    
-                    for btn in buttons:
-                        try:
-                            btn_css = btn.replace(':has-text', '').replace('("', '').replace('")', '')
-                            elements = driver.find_elements(By.CSS_SELECTOR, btn_css)
-                            if elements and elements[0].is_displayed():
-                                if self.debug:
-                                    logger.debug(f"Browser {index}: Verification trigger found, clicking...")
-                                elements[0].click()
-                                time.sleep(2)
-                                break
-                        except:
-                            continue
-                except Exception as e:
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Optional click flow info: {e}")
-
-                time.sleep(2)
+                time.sleep(3)
 
                 max_attempts = 15
                 
@@ -581,61 +581,50 @@ class TurnstileAPIServer:
                         
                         if not token_elements:
                             if self.debug:
-                                logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
+                                logger.debug(f"Browser {index}: No token found attempt {attempt + 1}")
                         else:
                             for token_elem in token_elements:
                                 token = token_elem.get_attribute('value')
                                 if token:
                                     elapsed_time = round(time.time() - start_time, 3)
-                                    logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                                    logger.success(f"Browser {index}: SOLVED! Token: {token[:20]}... in {elapsed_time}s")
                                     await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
                                     await self.driver_pool.put((index, driver))
                                     return
                         
                         if attempt > 2 and attempt % 3 == 0:
-                            click_success = await self._try_click_strategies(driver, index)
-                            if not click_success and self.debug:
-                                logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1}")
+                            await self._try_click_strategies(driver, index)
                         
                         if attempt == 10:
                             try:
                                 if not token_elements:
-                                    if self.debug:
-                                        logger.debug(f"Browser {index}: Creating overlay as fallback strategy")
                                     await self._load_captcha_overlay(driver, sitekey, action or '', index)
                                     time.sleep(2)
-                            except Exception as e:
-                                if self.debug:
-                                    logger.debug(f"Browser {index}: Fallback overlay creation failed: {str(e)}")
+                            except:
+                                pass
                         
                         wait_time = min(0.5 + (attempt * 0.05), 1.5)
                         time.sleep(wait_time)
-                        
-                        if self.debug and attempt % 5 == 0:
-                            logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - No valid token yet")
                             
                     except Exception as e:
                         if self.debug:
-                            logger.debug(f"Browser {index}: Attempt {attempt + 1} error: {str(e)}")
+                            logger.debug(f"Browser {index}: Attempt error: {str(e)}")
                         continue
                 
                 elapsed_time = round(time.time() - start_time, 3)
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
-                if self.debug:
-                    logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                logger.error(f"Browser {index}: FAILED to solve in {elapsed_time}s")
             except Exception as e:
                 elapsed_time = round(time.time() - start_time, 3)
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
-                if self.debug:
-                    logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
+                logger.error(f"Browser {index}: Error: {str(e)}")
             finally:
                 try:
                     await self.driver_pool.put((index, driver))
                     if self.debug:
                         logger.debug(f"Browser {index}: Driver returned to pool")
                 except Exception as e:
-                    if self.debug:
-                        logger.warning(f"Browser {index}: Error returning driver to pool: {str(e)}")
+                    logger.warning(f"Browser {index}: Error returning driver: {str(e)}")
 
     async def process_turnstile(self):
         url = request.args.get('url')
@@ -662,22 +651,13 @@ class TurnstileAPIServer:
             "proxy": "provided" if request_proxy else None
         })
 
-        try:
-            asyncio.create_task(self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata, request_proxy=request_proxy))
+        logger.info(f"📝 Created task {task_id} for {url}")
+        asyncio.create_task(self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata, request_proxy=request_proxy))
 
-            if self.debug:
-                logger.debug(f"Request completed with taskid {task_id}.")
-            return jsonify({
-                "errorId": 0,
-                "taskId": task_id
-            }), 200
-        except Exception as e:
-            logger.error(f"Unexpected error processing request: {str(e)}")
-            return jsonify({
-                "errorId": 1,
-                "errorCode": "ERROR_UNKNOWN",
-                "errorDescription": str(e)
-            }), 200
+        return jsonify({
+            "errorId": 0,
+            "taskId": task_id
+        }), 200
 
     async def get_result(self):
         task_id = request.args.get('id')
