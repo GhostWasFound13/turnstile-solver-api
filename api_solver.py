@@ -791,7 +791,7 @@ def parse_args():
     parser.add_argument('--browser', type=str, default='chrome', help='Browser name')
     parser.add_argument('--version', type=str, default='139', help='Browser version')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to run on')
-    parser.add_argument('--port', type=str, default='5072', help='Port to run on')
+    parser.add_argument('--port', type=str, default='8000', help='Port to run on')
     return parser.parse_args()
 
 
