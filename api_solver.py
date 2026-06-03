@@ -18,7 +18,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service
 
-# Remove rich - too heavy
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] -> %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("TurnstileAPIServer")
 
@@ -158,7 +157,7 @@ class TurnstileAPIServer:
         self.app = Quart(__name__)
         self.debug = debug
         self.headless = headless
-        self.thread_count = 1  # Force 1 thread
+        self.thread_count = 1
         self.proxy_support = proxy_support
         self.driver_pool = asyncio.Queue()
         self.login_address = os.getenv("TURNSTILE_LOGIN_ADDRESS", "").strip()
@@ -171,7 +170,12 @@ class TurnstileAPIServer:
         self.app.after_serving(self._shutdown)
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
+        self.app.route('/health', methods=['GET'])(self.health)
         self.app.route('/')(self.index)
+
+    async def health(self):
+        """Health check endpoint for Koyeb"""
+        return jsonify({"status": "healthy"}), 200
 
     async def _startup(self) -> None:
         logger.info("Starting GeckoDriver initialization...")
@@ -201,9 +205,8 @@ class TurnstileAPIServer:
         firefox_options.add_argument("--no-sandbox")
         firefox_options.add_argument("--disable-dev-shm-usage")
         
-        # MAXIMUM MEMORY OPTIMIZATION
         firefox_options.set_preference("javascript.enabled", True)
-        firefox_options.set_preference("permissions.default.image", 2)  # Block images
+        firefox_options.set_preference("permissions.default.image", 2)
         firefox_options.set_preference("dom.ipc.processCount", 1)
         firefox_options.set_preference("browser.tabs.remote.autostart", False)
         firefox_options.set_preference("browser.cache.memory.enable", False)
@@ -231,9 +234,7 @@ class TurnstileAPIServer:
         logger.info(f"GeckoDriver pool initialized with 1 driver")
 
     def _click_turnstile(self, driver):
-        """Simple click strategy"""
         try:
-            # Try to find and click iframe
             iframes = driver.find_elements(By.CSS_SELECTOR, 'iframe[src*="turnstile"], iframe[src*="challenges.cloudflare.com"]')
             if iframes:
                 driver.switch_to.frame(iframes[0])
@@ -244,7 +245,6 @@ class TurnstileAPIServer:
                     return True
                 driver.switch_to.default_content()
             
-            # Try direct click
             widget = driver.find_elements(By.CSS_SELECTOR, '.cf-turnstile, [data-sitekey]')
             if widget:
                 widget[0].click()
@@ -264,37 +264,19 @@ class TurnstileAPIServer:
                 return
 
             start_time = time.time()
-            proxy = None
-
-            try:
-                if request_proxy:
-                    proxy = request_proxy.strip()
-                elif self.proxy_support:
-                    proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
-                    try:
-                        with open(proxy_file_path) as proxy_file:
-                            proxies = [line.strip() for line in proxy_file if line.strip()]
-                        proxy = random.choice(proxies) if proxies else None
-                    except:
-                        pass
-            except Exception as e:
-                logger.error(f"Proxy setup error: {e}")
 
             try:
                 logger.info(f"Loading URL: {url}")
                 driver.get(url)
                 
-                # Wait for page to load
-                time.sleep(3)
+                time.sleep(5)
                 
-                # Try to click if needed
                 self._click_turnstile(driver)
                 
-                max_attempts = 20
+                max_attempts = 25
                 
                 for attempt in range(max_attempts):
                     try:
-                        # Check for token
                         token_elements = driver.find_elements(By.CSS_SELECTOR, 'input[name="cf-turnstile-response"]')
                         
                         for token_elem in token_elements:
@@ -306,11 +288,10 @@ class TurnstileAPIServer:
                                 await self.driver_pool.put((index, driver))
                                 return
                         
-                        # Try clicking every 5 attempts
                         if attempt > 0 and attempt % 5 == 0:
                             self._click_turnstile(driver)
                         
-                        time.sleep(2)
+                        await asyncio.sleep(2)
                             
                     except Exception as e:
                         if self.debug:
