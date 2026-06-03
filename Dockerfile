@@ -1,10 +1,11 @@
 FROM python:3.11-slim-bookworm
 
-# Install Chrome and ChromeDriver using your wget command
+# Install dependencies
 RUN apt-get update && apt-get install -y \
     wget \
     unzip \
     chromium \
+    chromium-driver \
     libglib2.0-0 \
     libnss3 \
     libx11-6 \
@@ -18,8 +19,8 @@ RUN apt-get update && apt-get install -y \
     libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
-# YOUR wget command for ChromeDriver
-RUN wget https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.177/linux64/chromedriver-linux64.zip && \
+# Install matching ChromeDriver version 148 (matches installed Chrome)
+RUN wget https://storage.googleapis.com/chrome-for-testing-public/148.0.7778.215/linux64/chromedriver-linux64.zip && \
     unzip chromedriver-linux64.zip && \
     chmod +x chromedriver-linux64/chromedriver && \
     mv chromedriver-linux64/chromedriver /usr/local/bin/chromedriver && \
