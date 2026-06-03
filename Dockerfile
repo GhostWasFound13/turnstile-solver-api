@@ -1,10 +1,9 @@
 FROM python:3.11-slim-bookworm
 
-# Install Firefox and dependencies
+# Install Firefox and dependencies (removed firefox-esr-driver)
 RUN apt-get update && apt-get install -y \
     wget \
     firefox-esr \
-    firefox-esr-driver \
     libglib2.0-0 \
     libnss3 \
     libx11-6 \
