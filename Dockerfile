@@ -8,19 +8,9 @@ RUN apt-get update && apt-get install -y \
     libgtk-3-0 \
     libdbus-glib-1-2 \
     libxt6 \
-    libx11-xcb1 \
-    libxcb-shm0 \
-    libxcb-keysyms1 \
-    libxcb-randr0 \
-    libxcb-render0 \
-    libxcb-shape0 \
-    libxcb-xfixes0 \
-    libxcb-xinerama0 \
-    libxcb-xkb1 \
-    libxkbcommon-x11-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Download GeckoDriver
+# Install geckodriver
 RUN wget -q https://github.com/mozilla/geckodriver/releases/download/v0.34.0/geckodriver-v0.34.0-linux64.tar.gz && \
     tar -xzf geckodriver-v0.34.0-linux64.tar.gz && \
     chmod +x geckodriver && \
@@ -34,16 +24,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY api_solver.py .
 
-ENV PYTHONUNBUFFERED=1
-ENV DISPLAY=:99
-
-# Start Xvfb virtual display, then run app
-RUN echo '#!/bin/bash\n\
-Xvfb :99 -screen 0 1280x1024x24 &\n\
-sleep 2\n\
-python api_solver.py --host 0.0.0.0 --port 5072 --thread 1 --no-headless' > /start.sh && \
-    chmod +x /start.sh
-
-EXPOSE 8000
-
-CMD ["/start.sh"]
+# Start Xvfb and then the app (all in one line)
+CMD Xvfb :99 -screen 0 1280x1024x24 & export DISPLAY=:99 && python api_solver.py --host 0.0.0.0 --port 8000 --thread 1 --no-headless
