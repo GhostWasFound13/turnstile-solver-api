@@ -319,13 +319,12 @@ class TurnstileAPIServer:
         firefox_options.add_argument("--no-sandbox")
         firefox_options.add_argument("--disable-dev-shm-usage")
         
-        # MEMORY OPTIMIZATION PREFERENCES
         firefox_options.set_preference("dom.webdriver.enabled", False)
         firefox_options.set_preference("useAutomationExtension", False)
         firefox_options.set_preference("media.navigator.enabled", False)
         firefox_options.set_preference("javascript.enabled", True)
-        firefox_options.set_preference("permissions.default.image", 2)  # Block images
-        firefox_options.set_preference("dom.ipc.processCount", 1)  # Reduce processes
+        firefox_options.set_preference("permissions.default.image", 2)
+        firefox_options.set_preference("dom.ipc.processCount", 1)
         firefox_options.set_preference("browser.tabs.remote.autostart", False)
         firefox_options.set_preference("browser.tabs.remote.autostart.2", False)
         firefox_options.set_preference("browser.tabs.remote.separatePrivilegedContentProcess", False)
@@ -354,11 +353,9 @@ class TurnstileAPIServer:
         if self.useragent:
             firefox_options.set_preference("general.useragent.override", self.useragent)
         
-        # Setup service
         geckodriver_paths = [
             "/usr/local/bin/geckodriver",
             "/usr/bin/geckodriver",
-            "/snap/bin/geckodriver"
         ]
         
         service = None
@@ -374,7 +371,6 @@ class TurnstileAPIServer:
         for i in range(self.thread_count):
             try:
                 driver = webdriver.Firefox(options=firefox_options, service=service)
-                # Set page load timeout
                 driver.set_page_load_timeout(30)
                 driver.set_script_timeout(30)
                 await self.driver_pool.put((i+1, driver))
@@ -386,7 +382,7 @@ class TurnstileAPIServer:
         
         logger.info(f"GeckoDriver pool initialized with {self.driver_pool.qsize()} drivers")
 
-    async def _find_and_click_checkbox(self, driver, index: int):
+    def _find_and_click_checkbox(self, driver, index: int):
         try:
             iframe_selectors = [
                 'iframe[src*="challenges.cloudflare.com"]',
@@ -431,7 +427,7 @@ class TurnstileAPIServer:
         
         return False
 
-    async def _try_click_strategies(self, driver, index: int):
+    def _try_click_strategies(self, driver, index: int):
         strategies = [
             ('checkbox_click', lambda: self._find_and_click_checkbox(driver, index)),
             ('direct_widget', lambda: self._safe_click(driver, '.cf-turnstile', index)),
@@ -444,7 +440,7 @@ class TurnstileAPIServer:
         
         for strategy_name, strategy_func in strategies:
             try:
-                result = await strategy_func() if asyncio.iscoroutinefunction(strategy_func) else strategy_func()
+                result = strategy_func()
                 if result is True or result is None:
                     if self.debug:
                         logger.debug(f"Browser {index}: Click strategy '{strategy_name}' succeeded")
@@ -456,7 +452,7 @@ class TurnstileAPIServer:
         
         return False
 
-    async def _safe_click(self, driver, selector: str, index: int):
+    def _safe_click(self, driver, selector: str, index: int):
         try:
             element = WebDriverWait(driver, 2).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
@@ -466,7 +462,7 @@ class TurnstileAPIServer:
         except Exception:
             return False
 
-    async def _load_captcha_overlay(self, driver, websiteKey: str, action: str = '', index: int = 0):
+    def _load_captcha_overlay(self, driver, websiteKey: str, action: str = '', index: int = 0):
         script = f"""
         const existing = document.querySelector('#captcha-overlay');
         if (existing) existing.remove();
@@ -593,12 +589,12 @@ class TurnstileAPIServer:
                                     return
                         
                         if attempt > 2 and attempt % 3 == 0:
-                            await self._try_click_strategies(driver, index)
+                            self._try_click_strategies(driver, index)
                         
                         if attempt == 10:
                             try:
                                 if not token_elements:
-                                    await self._load_captcha_overlay(driver, sitekey, action or '', index)
+                                    self._load_captcha_overlay(driver, sitekey, action or '', index)
                                     time.sleep(2)
                             except:
                                 pass
