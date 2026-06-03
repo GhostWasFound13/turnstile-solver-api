@@ -16,6 +16,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -65,13 +66,11 @@ logger.addHandler(handler)
 
 # ============ JSON DATABASE WITH AUTO RESET EVERY 5 HOURS ============
 DB_PATH = "results.json"
-LAST_CLEANUP_FILE = "last_cleanup.txt"
 
 def _get_current_time():
     return datetime.now()
 
 def _load_db() -> Dict:
-    """Load database from JSON file"""
     try:
         if os.path.exists(DB_PATH):
             with open(DB_PATH, 'r') as f:
@@ -82,7 +81,6 @@ def _load_db() -> Dict:
         return {}
 
 def _save_db(data: Dict) -> None:
-    """Save database to JSON file"""
     try:
         with open(DB_PATH, 'w') as f:
             json.dump(data, f, indent=2)
@@ -90,25 +88,20 @@ def _save_db(data: Dict) -> None:
         logger.error(f"Error saving database: {e}")
 
 async def init_db():
-    """Initialize database - create file if not exists"""
     if not os.path.exists(DB_PATH):
         _save_db({})
         logger.info(f"Database initialized: {DB_PATH}")
-    
-    # Start auto cleanup task
     asyncio.create_task(_auto_cleanup_loop())
 
 async def _auto_cleanup_loop():
-    """Auto cleanup every 5 hours"""
     while True:
         try:
-            await asyncio.sleep(18000)  # 5 hours in seconds
+            await asyncio.sleep(18000)
             await cleanup_old_results(hours=5)
         except Exception as e:
             logger.error(f"Auto cleanup error: {e}")
 
 async def save_result(task_id: str, task_type: str, data: Union[Dict[str, Any], str]) -> None:
-    """Save result to JSON database"""
     try:
         db = _load_db()
         db[task_id] = {
@@ -121,20 +114,16 @@ async def save_result(task_id: str, task_type: str, data: Union[Dict[str, Any], 
         logger.error(f"Error saving result {task_id}: {e}")
 
 async def load_result(task_id: str) -> Optional[Union[Dict[str, Any], str]]:
-    """Load result from JSON database"""
     try:
         db = _load_db()
         if task_id in db:
-            result = db[task_id]
-            data = result.get("data")
-            return data
+            return db[task_id].get("data")
         return None
     except Exception as e:
         logger.error(f"Error loading result {task_id}: {e}")
         return None
 
 async def cleanup_old_results(hours: int = 5) -> int:
-    """Delete results older than specified hours"""
     try:
         db = _load_db()
         cutoff_time = _get_current_time() - timedelta(hours=hours)
@@ -152,15 +141,14 @@ async def cleanup_old_results(hours: int = 5) -> int:
         
         if deleted_count > 0:
             _save_db(db)
-            logger.info(f"Cleaned up {deleted_count} old results (older than {hours} hours)")
+            logger.info(f"Cleaned up {deleted_count} old results")
         
         return deleted_count
     except Exception as e:
-        logger.error(f"Error cleaning up old results: {e}")
+        logger.error(f"Error cleaning up: {e}")
         return 0
 
 async def get_pending_count() -> int:
-    """Get count of pending tasks"""
     try:
         db = _load_db()
         count = 0
@@ -168,17 +156,14 @@ async def get_pending_count() -> int:
             data = result.get("data", {})
             if isinstance(data, dict) and data.get("status") == "CAPTCHA_NOT_READY":
                 count += 1
-            elif isinstance(data, str) and data == "CAPTCHA_NOT_READY":
-                count += 1
         return count
     except Exception as e:
         logger.error(f"Error getting pending count: {e}")
         return 0
 
 
-# ============ BROWSER CONFIGURATION (MERGED) ============
+# ============ BROWSER CONFIGURATION ============
 def get_random_user_agent() -> str:
-    """Get random User-Agent"""
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -197,7 +182,6 @@ def _mask_secret(value: Optional[str]) -> Optional[str]:
 
 
 def parse_proxy_config(proxy: str) -> dict:
-    """Convert supported proxy formats into Chrome options."""
     raw_proxy = (proxy or "").strip()
     if not raw_proxy:
         raise ValueError("Invalid proxy format")
@@ -258,7 +242,7 @@ class TurnstileAPIServer:
     def __init__(self, headless: bool, useragent: Optional[str], debug: bool, browser_type: str, thread: int, proxy_support: bool, use_random_config: bool = False, browser_name: Optional[str] = None, browser_version: Optional[str] = None):
         self.app = Quart(__name__)
         self.debug = debug
-        self.browser_type = "chrome"  # Force ChromeDriver
+        self.browser_type = "chrome"
         self.headless = headless
         self.thread_count = min(thread, 1)
         self.proxy_support = proxy_support
@@ -276,7 +260,6 @@ class TurnstileAPIServer:
         self._setup_routes()
 
     def display_welcome(self):
-        """Displays welcome screen with logo."""
         self.console.clear()
         
         combined_text = Text()
@@ -330,6 +313,20 @@ class TurnstileAPIServer:
     async def _initialize_drivers(self) -> None:
         chrome_options = Options()
         
+        # CRITICAL FIX: Add binary location
+        possible_paths = [
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable"
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                chrome_options.binary_location = path
+                logger.info(f"Using Chrome binary: {path}")
+                break
+        
         if self.headless:
             chrome_options.add_argument("--headless=new")
         
@@ -351,13 +348,32 @@ class TurnstileAPIServer:
         chrome_options.add_argument("--disable-images")
         chrome_options.add_argument("--blink-settings=imagesEnabled=false")
         chrome_options.add_argument("--window-size=480,200")
+        chrome_options.add_argument("--remote-debugging-port=9222")
         
         if self.useragent:
             chrome_options.add_argument(f"--user-agent={self.useragent}")
         
+        # Setup service with explicit chromedriver path
+        chromedriver_paths = [
+            "/usr/local/bin/chromedriver",
+            "/usr/bin/chromedriver",
+            "/usr/lib/chromium/chromedriver"
+        ]
+        
+        service = None
+        for path in chromedriver_paths:
+            if os.path.exists(path):
+                logger.info(f"Using ChromeDriver: {path}")
+                service = Service(executable_path=path)
+                break
+        
+        if not service:
+            logger.warning("ChromeDriver not found in common paths, trying default")
+            service = Service()
+        
         for i in range(self.thread_count):
             try:
-                driver = webdriver.Chrome(options=chrome_options)
+                driver = webdriver.Chrome(options=chrome_options, service=service)
                 await self.driver_pool.put((i+1, driver))
                 if self.debug:
                     logger.info(f"ChromeDriver {i + 1} initialized successfully")
@@ -765,17 +781,17 @@ class TurnstileAPIServer:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Turnstile API Server")
-    parser.add_argument('--no-headless', action='store_true', help='Run the browser with GUI (disable headless mode). By default, headless mode is enabled.')
-    parser.add_argument('--useragent', type=str, help='User-Agent string (if not specified, random configuration is used)')
-    parser.add_argument('--debug', action='store_true', help='Enable or disable debug mode for additional logging and troubleshooting information (default: False)')
-    parser.add_argument('--browser_type', type=str, default='chrome', help='Browser type (default: chrome)')
-    parser.add_argument('--thread', type=int, default=1, help='Number of browser threads (default: 1)')
-    parser.add_argument('--proxy', action='store_true', help='Enable proxy support for the solver (Default: False)')
-    parser.add_argument('--random', action='store_true', help='Use random User-Agent configuration')
+    parser.add_argument('--no-headless', action='store_true', help='Run the browser with GUI (disable headless mode)')
+    parser.add_argument('--useragent', type=str, help='User-Agent string')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--browser_type', type=str, default='chrome', help='Browser type')
+    parser.add_argument('--thread', type=int, default=1, help='Number of browser threads')
+    parser.add_argument('--proxy', action='store_true', help='Enable proxy support')
+    parser.add_argument('--random', action='store_true', help='Use random User-Agent')
     parser.add_argument('--browser', type=str, default='chrome', help='Browser name')
     parser.add_argument('--version', type=str, default='139', help='Browser version')
-    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to run on (Default: 0.0.0.0)')
-    parser.add_argument('--port', type=str, default='5072', help='Port to run on (Default: 5072)')
+    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to run on')
+    parser.add_argument('--port', type=str, default='5072', help='Port to run on')
     return parser.parse_args()
 
 
@@ -788,7 +804,7 @@ if __name__ == '__main__':
     args = parse_args()
     
     if args.thread > 1:
-        logger.warning(f"Thread count reduced from {args.thread} to 1 for resource limits")
+        logger.warning(f"Thread count reduced from {args.thread} to 1")
         args.thread = 1
         
     app = create_app(
