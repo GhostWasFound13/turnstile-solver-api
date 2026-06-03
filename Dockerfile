@@ -44,9 +44,6 @@ sleep 2\n\
 python api_solver.py --host 0.0.0.0 --port 5072 --thread 1 --no-headless' > /start.sh && \
     chmod +x /start.sh
 
-EXPOSE 5072
-
-CMD ["/start.sh"]
 EXPOSE 8000
 
-CMD ["python", "api_solver.py", "--host", "0.0.0.0", "--port", "8000", "--thread", "1", "--no-headless"]
+CMD ["/start.sh"]
