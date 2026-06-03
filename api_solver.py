@@ -326,6 +326,11 @@ class TurnstileAPIServer:
         firefox_options.set_preference("dom.ipc.processCount", 1)
         firefox_options.set_preference("browser.tabs.remote.autostart", False)
         firefox_options.set_preference("browser.tabs.remote.autostart.2", False)
+        firefox_options.set_preference("browser.tabs.remote.separatePrivilegedContentProcess", False)
+        firefox_options.set_preference("browser.tabs.remote.separatePrivilegedMozillaWebContentProcess", False)
+        firefox_options.set_preference("browser.tabs.remote.separateFileUriProcess", False)
+        firefox_options.set_preference("browser.tabs.remote.separatePrivilegedContentProcess", False)
+        firefox_options.binary_location = "/usr/bin/firefox-esr"
         
         if self.useragent:
             firefox_options.set_preference("general.useragent.override", self.useragent)
