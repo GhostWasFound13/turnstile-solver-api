@@ -48,6 +48,6 @@ COPY api_solver.py .
 ENV PYTHONUNBUFFERED=1
 ENV PATH="/usr/local/bin:${PATH}"
 
-EXPOSE 5072
+EXPOSE 8000
 
-CMD ["python", "api_solver.py", "--host", "0.0.0.0", "--port", "5072", "--thread", "1", "--no-headless"]
+CMD ["python", "api_solver.py", "--host", "0.0.0.0", "--port", "8000", "--thread", "1", "--no-headless"]
