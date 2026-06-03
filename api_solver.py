@@ -5,14 +5,17 @@ import uuid
 import random
 import logging
 import asyncio
-from typing import Optional, Union
+import json
+from typing import Optional, Union, Dict, Any
 import argparse
 from urllib.parse import urlparse, unquote
+from datetime import datetime, timedelta
 from quart import Quart, request, jsonify
-from camoufox.async_api import AsyncCamoufox
-from patchright.async_api import async_playwright
-from db_results import init_db, save_result, load_result, cleanup_old_results
-from browser_configs import browser_config
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -60,6 +63,131 @@ handler = logging.StreamHandler(sys.stdout)
 logger.addHandler(handler)
 
 
+# ============ JSON DATABASE WITH AUTO RESET EVERY 5 HOURS ============
+DB_PATH = "results.json"
+LAST_CLEANUP_FILE = "last_cleanup.txt"
+
+def _get_current_time():
+    return datetime.now()
+
+def _load_db() -> Dict:
+    """Load database from JSON file"""
+    try:
+        if os.path.exists(DB_PATH):
+            with open(DB_PATH, 'r') as f:
+                return json.load(f)
+        return {}
+    except Exception as e:
+        logger.error(f"Error loading database: {e}")
+        return {}
+
+def _save_db(data: Dict) -> None:
+    """Save database to JSON file"""
+    try:
+        with open(DB_PATH, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving database: {e}")
+
+async def init_db():
+    """Initialize database - create file if not exists"""
+    if not os.path.exists(DB_PATH):
+        _save_db({})
+        logger.info(f"Database initialized: {DB_PATH}")
+    
+    # Start auto cleanup task
+    asyncio.create_task(_auto_cleanup_loop())
+
+async def _auto_cleanup_loop():
+    """Auto cleanup every 5 hours"""
+    while True:
+        try:
+            await asyncio.sleep(18000)  # 5 hours in seconds
+            await cleanup_old_results(hours=5)
+        except Exception as e:
+            logger.error(f"Auto cleanup error: {e}")
+
+async def save_result(task_id: str, task_type: str, data: Union[Dict[str, Any], str]) -> None:
+    """Save result to JSON database"""
+    try:
+        db = _load_db()
+        db[task_id] = {
+            "type": task_type,
+            "data": data if isinstance(data, dict) else {"value": data},
+            "created_at": _get_current_time().isoformat()
+        }
+        _save_db(db)
+    except Exception as e:
+        logger.error(f"Error saving result {task_id}: {e}")
+
+async def load_result(task_id: str) -> Optional[Union[Dict[str, Any], str]]:
+    """Load result from JSON database"""
+    try:
+        db = _load_db()
+        if task_id in db:
+            result = db[task_id]
+            data = result.get("data")
+            return data
+        return None
+    except Exception as e:
+        logger.error(f"Error loading result {task_id}: {e}")
+        return None
+
+async def cleanup_old_results(hours: int = 5) -> int:
+    """Delete results older than specified hours"""
+    try:
+        db = _load_db()
+        cutoff_time = _get_current_time() - timedelta(hours=hours)
+        deleted_count = 0
+        to_delete = []
+        
+        for task_id, result in db.items():
+            created_at = datetime.fromisoformat(result.get("created_at", "2000-01-01T00:00:00"))
+            if created_at < cutoff_time:
+                to_delete.append(task_id)
+        
+        for task_id in to_delete:
+            del db[task_id]
+            deleted_count += 1
+        
+        if deleted_count > 0:
+            _save_db(db)
+            logger.info(f"Cleaned up {deleted_count} old results (older than {hours} hours)")
+        
+        return deleted_count
+    except Exception as e:
+        logger.error(f"Error cleaning up old results: {e}")
+        return 0
+
+async def get_pending_count() -> int:
+    """Get count of pending tasks"""
+    try:
+        db = _load_db()
+        count = 0
+        for result in db.values():
+            data = result.get("data", {})
+            if isinstance(data, dict) and data.get("status") == "CAPTCHA_NOT_READY":
+                count += 1
+            elif isinstance(data, str) and data == "CAPTCHA_NOT_READY":
+                count += 1
+        return count
+    except Exception as e:
+        logger.error(f"Error getting pending count: {e}")
+        return 0
+
+
+# ============ BROWSER CONFIGURATION (MERGED) ============
+def get_random_user_agent() -> str:
+    """Get random User-Agent"""
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    ]
+    return random.choice(user_agents)
+
+
 def _mask_secret(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -69,15 +197,7 @@ def _mask_secret(value: Optional[str]) -> Optional[str]:
 
 
 def parse_proxy_config(proxy: str) -> dict:
-    """Convert supported proxy formats into Patchright/Playwright context config.
-
-    Supported formats:
-    - ip:port
-    - ip:port:username:password
-    - scheme://ip:port
-    - scheme://username:password@ip:port
-    - scheme:ip:port:username:password, kept for backward compatibility
-    """
+    """Convert supported proxy formats into Chrome options."""
     raw_proxy = (proxy or "").strip()
     if not raw_proxy:
         raise ValueError("Invalid proxy format")
@@ -138,44 +258,20 @@ class TurnstileAPIServer:
     def __init__(self, headless: bool, useragent: Optional[str], debug: bool, browser_type: str, thread: int, proxy_support: bool, use_random_config: bool = False, browser_name: Optional[str] = None, browser_version: Optional[str] = None):
         self.app = Quart(__name__)
         self.debug = debug
-        self.browser_type = browser_type
+        self.browser_type = "chrome"  # Force ChromeDriver
         self.headless = headless
-        # Force thread count to max 1 for Koyeb resource limits
-        self.thread_count = min(thread, 1)  # CRITICAL: Only 1 browser to save memory
+        self.thread_count = min(thread, 1)
         self.proxy_support = proxy_support
-        self.browser_pool = asyncio.Queue()
+        self.driver_pool = asyncio.Queue()
         self.use_random_config = use_random_config
-        self.browser_name = browser_name
-        self.browser_version = browser_version
+        self.browser_name = browser_name or "chrome"
+        self.browser_version = browser_version or "139"
         self.console = Console()
         self.login_address = os.getenv("TURNSTILE_LOGIN_ADDRESS", "").strip()
-        self.active_tasks = set()  # Track active tasks for cleanup
-        self.semaphore = asyncio.Semaphore(1)  # Only process 1 task at a time
+        self.active_tasks = set()
+        self.semaphore = asyncio.Semaphore(1)
         
-        # Initialize useragent and sec_ch_ua attributes
-        self.useragent = useragent
-        self.sec_ch_ua = None
-        
-        
-        if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            if browser_name and browser_version:
-                config = browser_config.get_browser_config(browser_name, browser_version)
-                if config:
-                    useragent, sec_ch_ua = config
-                    self.useragent = useragent
-                    self.sec_ch_ua = sec_ch_ua
-            elif useragent:
-                self.useragent = useragent
-            else:
-                browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
-                self.browser_name = browser
-                self.browser_version = version
-                self.useragent = useragent
-                self.sec_ch_ua = sec_ch_ua
-        
-        self.browser_args = []
-        if self.useragent:
-            self.browser_args.append(f"--user-agent={self.useragent}")
+        self.useragent = useragent if useragent else get_random_user_agent()
 
         self._setup_routes()
 
@@ -184,15 +280,15 @@ class TurnstileAPIServer:
         self.console.clear()
         
         combined_text = Text()
-        combined_text.append("\nHigh-throughput Turnstile solver API", style="bold white")
-        combined_text.append(f"\nRuntime: Quart + Patchright/Camoufox (Threads: {self.thread_count})", style="cyan")
-        combined_text.append("\nStorage: SQLite (WAL mode)", style="cyan")
+        combined_text.append("\nTurnstile Solver API - ChromeDriver Edition", style="bold white")
+        combined_text.append(f"\nRuntime: Quart + Selenium/ChromeDriver (Threads: {self.thread_count})", style="cyan")
+        combined_text.append("\nStorage: JSON (Auto-reset every 5 hours)", style="cyan")
         combined_text.append("\n")
 
         info_panel = Panel(
             Align.left(combined_text),
             title="[bold blue]Turnstile Solver API[/bold blue]",
-            subtitle="[bold magenta]Koyeb Optimized Build[/bold magenta]",
+            subtitle="[bold magenta]ChromeDriver Only Build[/bold magenta]",
             box=box.ROUNDED,
             border_style="bright_blue",
             padding=(0, 1),
@@ -202,11 +298,7 @@ class TurnstileAPIServer:
         self.console.print(info_panel)
         self.console.print()
 
-
-
-
     def _setup_routes(self) -> None:
-        """Set up the application routes."""
         self.app.before_serving(self._startup)
         self.app.after_serving(self._shutdown)
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
@@ -214,227 +306,68 @@ class TurnstileAPIServer:
         self.app.route('/')(self.index)
         self.app.route('/docs')(self.index)
         self.app.route('/docs/')(self.index)
-        
 
     async def _startup(self) -> None:
-        """Initialize the browser and page pool on startup."""
         self.display_welcome()
-        logger.info(f"Starting browser initialization with {self.thread_count} browser(s)")
+        logger.info(f"Starting ChromeDriver initialization with {self.thread_count} driver(s)")
         try:
             await init_db()
-            await self._initialize_browser()
-            
-            # Запускаем периодическую очистку старых результатов
-            asyncio.create_task(self._periodic_cleanup())
-            
+            await self._initialize_drivers()
         except Exception as e:
-            logger.error(f"Failed to initialize browser: {str(e)}")
+            logger.error(f"Failed to initialize ChromeDriver: {str(e)}")
             raise
 
     async def _shutdown(self) -> None:
-        """Clean shutdown of browsers"""
-        logger.info("Shutting down browser pool...")
-        while not self.browser_pool.empty():
+        logger.info("Shutting down driver pool...")
+        while not self.driver_pool.empty():
             try:
-                index, browser, config = await self.browser_pool.get()
-                await browser.close()
+                index, driver = await self.driver_pool.get()
+                driver.quit()
             except:
                 pass
         logger.info("Shutdown complete")
 
-    async def _initialize_browser(self) -> None:
-        """Initialize the browser and create the page pool."""
-        playwright = None
-        camoufox = None
-
-        if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            playwright = await async_playwright().start()
-        elif self.browser_type == "camoufox":
-            camoufox = AsyncCamoufox(headless=self.headless)
-
-        browser_configs = []
-        for _ in range(self.thread_count):
-            if self.browser_type in ['chromium', 'chrome', 'msedge']:
-                if self.use_random_config:
-                    browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
-                elif self.browser_name and self.browser_version:
-                    config = browser_config.get_browser_config(self.browser_name, self.browser_version)
-                    if config:
-                        useragent, sec_ch_ua = config
-                        browser = self.browser_name
-                        version = self.browser_version
-                    else:
-                        browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
-                else:
-                    browser = getattr(self, 'browser_name', 'custom')
-                    version = getattr(self, 'browser_version', 'custom')
-                    useragent = self.useragent
-                    sec_ch_ua = getattr(self, 'sec_ch_ua', '')
-            else:
-                # Для camoufox и других браузеров используем значения по умолчанию
-                browser = self.browser_type
-                version = 'custom'
-                useragent = self.useragent
-                sec_ch_ua = getattr(self, 'sec_ch_ua', '')
-
-            
-            browser_configs.append({
-                'browser_name': browser,
-                'browser_version': version,
-                'useragent': useragent,
-                'sec_ch_ua': sec_ch_ua
-            })
-
+    async def _initialize_drivers(self) -> None:
+        chrome_options = Options()
+        
+        if self.headless:
+            chrome_options.add_argument("--headless=new")
+        
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--disable-software-rasterizer")
+        chrome_options.add_argument("--disable-background-timer-throttling")
+        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+        chrome_options.add_argument("--disable-renderer-backgrounding")
+        chrome_options.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
+        chrome_options.add_argument("--disable-ipc-flooding-protection")
+        chrome_options.add_argument("--disable-hang-monitor")
+        chrome_options.add_argument("--disable-prompt-on-repost")
+        chrome_options.add_argument("--disable-sync")
+        chrome_options.add_argument("--disable-default-apps")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-plugins")
+        chrome_options.add_argument("--disable-images")
+        chrome_options.add_argument("--blink-settings=imagesEnabled=false")
+        chrome_options.add_argument("--window-size=480,200")
+        
+        if self.useragent:
+            chrome_options.add_argument(f"--user-agent={self.useragent}")
+        
         for i in range(self.thread_count):
-            config = browser_configs[i]
-            
-            browser_args = []
-            if config['useragent']:
-                browser_args.append(f"--user-agent={config['useragent']}")
-            
-            # Add memory optimization args
-            browser_args.extend([
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-software-rasterizer',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-features=TranslateUI,BlinkGenPropertyTrees',
-                '--disable-ipc-flooding-protection',
-                '--disable-hang-monitor',
-                '--disable-prompt-on-repost',
-                '--disable-sync',
-                '--disable-default-apps',
-                '--disable-extensions',
-                '--disable-component-extensions-with-background-pages',
-                '--disable-plugins',
-                '--disable-images',  # Block images to save memory
-                '--disable-javascript',  # Block JS except needed domains
-                '--blink-settings=imagesEnabled=false',
-            ])
-            
-            browser = None
             try:
-                if self.browser_type in ['chromium', 'chrome', 'msedge'] and playwright:
-                    browser = await playwright.chromium.launch(
-                        channel=self.browser_type,
-                        headless=self.headless,
-                        args=browser_args
-                    )
-                elif self.browser_type == "camoufox" and camoufox:
-                    browser = await camoufox.start()
-
-                if browser:
-                    await self.browser_pool.put((i+1, browser, config))
-                    if self.debug:
-                        logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
-            except Exception as e:
-                logger.error(f"Failed to initialize browser {i+1}: {e}")
-                continue
-
-        logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
-        
-        if self.use_random_config:
-            logger.info(f"Each browser in pool received random configuration")
-        elif self.browser_name and self.browser_version:
-            logger.info(f"All browsers using configuration: {self.browser_name} {self.browser_version}")
-        else:
-            logger.info("Using custom configuration")
-            
-        if self.debug:
-            for i, config in enumerate(browser_configs):
-                logger.debug(f"Browser {i+1} config: {config['browser_name']} {config['browser_version']}")
-                logger.debug(f"Browser {i+1} User-Agent: {config['useragent']}")
-                logger.debug(f"Browser {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
-
-    async def _periodic_cleanup(self):
-        """Periodic cleanup of old results every hour"""
-        while True:
-            try:
-                await asyncio.sleep(3600)
-                deleted_count = await cleanup_old_results(days_old=7)
-                if deleted_count > 0:
-                    logger.info(f"Cleaned up {deleted_count} old results")
-            except Exception as e:
-                logger.error(f"Error during periodic cleanup: {e}")
-
-    async def _antishadow_inject(self, page):
-        await page.add_init_script("""
-          (function() {
-            const originalAttachShadow = Element.prototype.attachShadow;
-            Element.prototype.attachShadow = function(init) {
-              const shadow = originalAttachShadow.call(this, init);
-              if (init.mode === 'closed') {
-                window.__lastClosedShadowRoot = shadow;
-              }
-              return shadow;
-            };
-          })();
-        """)
-
-
-
-    async def _optimized_route_handler(self, route):
-        """Optimized route handler to block unnecessary resources."""
-        url = route.request.url
-        resource_type = route.request.resource_type
-
-        # Only allow critical resources
-        allowed_types = {'document', 'xhr', 'fetch'}
-        
-        allowed_domains = [
-            'challenges.cloudflare.com',
-            'turnstile.afpd2t5f.cf'
-        ]
-        
-        if resource_type in allowed_types:
-            await route.continue_()
-        elif any(domain in url for domain in allowed_domains):
-            await route.continue_() 
-        else:
-            await route.abort()
-
-    async def _block_rendering(self, page):
-        """Block rendering and non-essential resources"""
-        await page.route("**/*", self._optimized_route_handler)
-
-    async def _unblock_rendering(self, page):
-        """Unblock rendering"""
-        await page.unroute("**/*", self._optimized_route_handler)
-
-    async def _find_turnstile_elements(self, page, index: int):
-        """Smart check for Turnstile elements"""
-        selectors = [
-            '.cf-turnstile',
-            '[data-sitekey]',
-            'iframe[src*="turnstile"]',
-            'iframe[title*="widget"]',
-            'div[id*="turnstile"]',
-            'div[class*="turnstile"]'
-        ]
-        
-        elements = []
-        for selector in selectors:
-            try:
-                try:
-                    count = await page.locator(selector).count()
-                except Exception:
-                    continue
-                    
-                if count > 0:
-                    elements.append((selector, count))
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Found {count} elements with selector '{selector}'")
-            except Exception as e:
+                driver = webdriver.Chrome(options=chrome_options)
+                await self.driver_pool.put((i+1, driver))
                 if self.debug:
-                    logger.debug(f"Browser {index}: Selector '{selector}' failed: {str(e)}")
+                    logger.info(f"ChromeDriver {i + 1} initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize ChromeDriver {i+1}: {e}")
                 continue
         
-        return elements
+        logger.info(f"ChromeDriver pool initialized with {self.driver_pool.qsize()} drivers")
 
-    async def _find_and_click_checkbox(self, page, index: int):
-        """Find and click Turnstile CAPTCHA checkbox inside iframe"""
+    async def _find_and_click_checkbox(self, driver, index: int):
         try:
             iframe_selectors = [
                 'iframe[src*="challenges.cloudflare.com"]',
@@ -442,79 +375,57 @@ class TurnstileAPIServer:
                 'iframe[title*="widget"]'
             ]
             
-            iframe_locator = None
             for selector in iframe_selectors:
                 try:
-                    test_locator = page.locator(selector).first
-                    try:
-                        iframe_count = await test_locator.count()
-                    except Exception:
-                        iframe_count = 0
+                    iframes = driver.find_elements(By.CSS_SELECTOR, selector)
+                    if iframes:
+                        iframe = iframes[0]
+                        driver.switch_to.frame(iframe)
                         
-                    if iframe_count > 0:
-                        iframe_locator = test_locator
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Found Turnstile iframe with selector: {selector}")
-                        break
-                except Exception as e:
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Iframe selector '{selector}' failed: {str(e)}")
-                    continue
-            
-            if iframe_locator:
-                try:
-                    iframe_element = await iframe_locator.element_handle()
-                    frame = await iframe_element.content_frame()
-                    
-                    if frame:
                         checkbox_selectors = [
                             'input[type="checkbox"]',
                             '.cb-lb input[type="checkbox"]',
                             'label input[type="checkbox"]'
                         ]
                         
-                        for selector in checkbox_selectors:
+                        for cb_selector in checkbox_selectors:
                             try:
-                                checkbox = frame.locator(selector).first
-                                await checkbox.click(timeout=2000)
+                                checkbox = WebDriverWait(driver, 2).until(
+                                    EC.element_to_be_clickable((By.CSS_SELECTOR, cb_selector))
+                                )
+                                checkbox.click()
+                                driver.switch_to.default_content()
                                 if self.debug:
-                                    logger.debug(f"Browser {index}: Successfully clicked checkbox in iframe with selector '{selector}'")
+                                    logger.debug(f"Browser {index}: Successfully clicked checkbox in iframe")
                                 return True
-                            except Exception:
+                            except:
                                 continue
-                    
-                        try:
-                            if self.debug:
-                                logger.debug(f"Browser {index}: Trying to click iframe directly as fallback")
-                            await iframe_locator.click(timeout=1000)
-                            return True
-                        except Exception:
-                            pass
-                
+                        
+                        driver.switch_to.default_content()
                 except Exception as e:
                     if self.debug:
-                        logger.debug(f"Browser {index}: Failed to access iframe content: {str(e)}")
-            
+                        logger.debug(f"Browser {index}: Iframe selector '{selector}' failed: {str(e)}")
+                    continue
         except Exception as e:
             if self.debug:
                 logger.debug(f"Browser {index}: General iframe search failed: {str(e)}")
         
         return False
 
-    async def _try_click_strategies(self, page, index: int):
+    async def _try_click_strategies(self, driver, index: int):
         strategies = [
-            ('checkbox_click', lambda: self._find_and_click_checkbox(page, index)),
-            ('direct_widget', lambda: self._safe_click(page, '.cf-turnstile', index)),
-            ('iframe_click', lambda: self._safe_click(page, 'iframe[src*="turnstile"]', index)),
-            ('js_click', lambda: page.evaluate("document.querySelector('.cf-turnstile')?.click()")),
-            ('sitekey_attr', lambda: self._safe_click(page, '[data-sitekey]', index)),
-            ('any_turnstile', lambda: self._safe_click(page, '*[class*="turnstile"]', index)),
-            ('xpath_click', lambda: self._safe_click(page, "//div[@class='cf-turnstile']", index))
+            ('checkbox_click', lambda: self._find_and_click_checkbox(driver, index)),
+            ('direct_widget', lambda: self._safe_click(driver, '.cf-turnstile', index)),
+            ('iframe_click', lambda: self._safe_click(driver, 'iframe[src*="turnstile"]', index)),
+            ('js_click', lambda: driver.execute_script("document.querySelector('.cf-turnstile')?.click()")),
+            ('sitekey_attr', lambda: self._safe_click(driver, '[data-sitekey]', index)),
+            ('any_turnstile', lambda: self._safe_click(driver, '*[class*="turnstile"]', index)),
+            ('xpath_click', lambda: self._safe_click(driver, "//div[@class='cf-turnstile']", index))
         ]
         
         for strategy_name, strategy_func in strategies:
             try:
-                result = await strategy_func()
+                result = await strategy_func() if asyncio.iscoroutinefunction(strategy_func) else strategy_func()
                 if result is True or result is None:
                     if self.debug:
                         logger.debug(f"Browser {index}: Click strategy '{strategy_name}' succeeded")
@@ -526,16 +437,17 @@ class TurnstileAPIServer:
         
         return False
 
-    async def _safe_click(self, page, selector: str, index: int):
-        """Safely click element"""
+    async def _safe_click(self, driver, selector: str, index: int):
         try:
-            locator = page.locator(selector).first
-            await locator.click(timeout=1000)
+            element = WebDriverWait(driver, 2).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+            )
+            element.click()
             return True
         except Exception:
             return False
 
-    async def _load_captcha_overlay(self, page, websiteKey: str, action: str = '', index: int = 0):
+    async def _load_captcha_overlay(self, driver, websiteKey: str, action: str = '', index: int = 0):
         script = f"""
         const existing = document.querySelector('#captcha-overlay');
         if (existing) existing.remove();
@@ -568,56 +480,36 @@ class TurnstileAPIServer:
         script.defer = true;
         document.head.appendChild(script);
         """
-
-        await page.evaluate(script)
+        driver.execute_script(script)
         if self.debug:
             logger.debug(f"Browser {index}: Created CAPTCHA overlay with sitekey: {websiteKey}")
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None, request_proxy: Optional[str] = None):
-        """Solve the Turnstile challenge."""
-        async with self.semaphore:  # Only process one task at a time
+        async with self.semaphore:
             proxy = None
 
-            # Wait for browser with timeout
             try:
-                index, browser, browser_config = await asyncio.wait_for(self.browser_pool.get(), timeout=30.0)
+                index, driver = await asyncio.wait_for(self.driver_pool.get(), timeout=30.0)
             except asyncio.TimeoutError:
-                logger.error(f"Task {task_id}: Timeout waiting for browser")
+                logger.error(f"Task {task_id}: Timeout waiting for driver")
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
                 return
-            
-            try:
-                if hasattr(browser, 'is_connected') and not browser.is_connected():
-                    if self.debug:
-                        logger.warning(f"Browser {index}: Browser disconnected, skipping")
-                    await self.browser_pool.put((index, browser, browser_config))
-                    await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
-                    return
-            except Exception as e:
-                if self.debug:
-                    logger.warning(f"Browser {index}: Cannot check browser state: {str(e)}")
 
             start_time = time.time()
-            context = None
             proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
 
             try:
                 if request_proxy:
                     proxy = request_proxy.strip()
                     if self.debug:
-                        logger.debug("Browser %s: Using request-level proxy override", index)
+                        logger.debug(f"Browser {index}: Using request-level proxy override")
                 elif self.proxy_support:
                     try:
                         with open(proxy_file_path) as proxy_file:
                             proxies = [line.strip() for line in proxy_file if line.strip()]
-
                         proxy = random.choice(proxies) if proxies else None
-
                         if self.debug and proxy:
                             logger.debug(f"Browser {index}: Selected proxy from file")
-                        elif self.debug and not proxy:
-                            logger.debug(f"Browser {index}: No proxies available")
-
                     except FileNotFoundError:
                         logger.warning(f"Proxy file not found: {proxy_file_path}")
                         proxy = None
@@ -625,65 +517,35 @@ class TurnstileAPIServer:
                         logger.error(f"Error reading proxy file: {str(e)}")
                         proxy = None
 
-                context_options = {"user_agent": browser_config['useragent']}
-
-                if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                    context_options['extra_http_headers'] = {
-                        'sec-ch-ua': browser_config['sec_ch_ua']
-                    }
-
-                if proxy:
-                    proxy_config = parse_proxy_config(proxy)
-                    context_options["proxy"] = proxy_config
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Creating context with proxy {redact_proxy_config(proxy_config)}")
-                elif self.debug:
-                    logger.debug(f"Browser {index}: Creating context without proxy")
-
-                context = await browser.new_context(**context_options)
-                page = await context.new_page()
             except Exception as e:
                 elapsed_time = round(time.time() - start_time, 3)
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
-                logger.error(f"Browser {index}: Failed to create browser context: {str(e)}")
-                try:
-                    if hasattr(browser, 'is_connected') and browser.is_connected():
-                        await self.browser_pool.put((index, browser, browser_config))
-                except Exception as pool_error:
-                    if self.debug:
-                        logger.warning(f"Browser {index}: Error returning browser after context failure: {str(pool_error)}")
+                logger.error(f"Browser {index}: Failed to setup: {str(e)}")
+                await self.driver_pool.put((index, driver))
                 return
-            
-            await self._block_rendering(page)
-        
-            if self.browser_type in ['chromium', 'chrome', 'msedge']:
-                await page.set_viewport_size({"width": 480, "height": 200})  # Smaller viewport
-                if self.debug:
-                    logger.debug(f"Browser {index}: Set viewport size to 480x200")
 
             try:
                 if self.debug:
-                    logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {'provided' if proxy else 'none'}")
+                    logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey}")
 
-                # Shorter timeout for page load
-                await page.goto(url, wait_until='domcontentloaded', timeout=15000)
-
-                await self._unblock_rendering(page)
+                driver.get(url)
 
                 try:
-                    login_input = page.locator('input[name="address"]')
-                    if self.login_address and await login_input.count() > 0 and await login_input.is_visible():
+                    login_input = driver.find_elements(By.CSS_SELECTOR, 'input[name="address"]')
+                    if self.login_address and login_input:
                         if self.debug:
                             logger.debug(f"Browser {index}: Login page detected, submitting configured TURNSTILE_LOGIN_ADDRESS")
                         
-                        await login_input.fill(self.login_address)
-                        await asyncio.sleep(0.5)
-                        await page.locator('button[type="submit"]').click()
+                        login_input[0].send_keys(self.login_address)
+                        time.sleep(0.5)
+                        
+                        submit_btn = driver.find_elements(By.CSS_SELECTOR, 'button[type="submit"]')
+                        if submit_btn:
+                            submit_btn[0].click()
                         
                         if self.debug:
                             logger.debug(f"Browser {index}: Login submitted, waiting for verification page")
-                        await page.wait_for_load_state('domcontentloaded')
-                        await asyncio.sleep(2)
+                        time.sleep(2)
                 except Exception as e:
                     if self.debug:
                         logger.debug(f"Browser {index}: Optional login flow info: {e}")
@@ -695,86 +557,62 @@ class TurnstileAPIServer:
                         'button:has-text("Click to verify")',
                         '.btn-primary-modern:has-text("Security")'
                     ]
-
+                    
                     for btn in buttons:
-                        if await page.locator(btn).count() > 0:
-                            if await page.locator(btn).is_visible():
+                        try:
+                            btn_css = btn.replace(':has-text', '').replace('("', '').replace('")', '')
+                            elements = driver.find_elements(By.CSS_SELECTOR, btn_css)
+                            if elements and elements[0].is_displayed():
                                 if self.debug:
-                                    logger.debug(f"Browser {index}: Verification trigger found ({btn}), clicking...")
-                                
-                                await page.locator(btn).click(force=True)
-                                await asyncio.sleep(2)
+                                    logger.debug(f"Browser {index}: Verification trigger found, clicking...")
+                                elements[0].click()
+                                time.sleep(2)
                                 break
+                        except:
+                            continue
                 except Exception as e:
                     if self.debug:
                         logger.debug(f"Browser {index}: Optional click flow info: {e}")
 
-                await asyncio.sleep(2)
+                time.sleep(2)
 
-                locator = page.locator('input[name="cf-turnstile-response"]')
-                max_attempts = 15  # Reduced attempts
+                max_attempts = 15
                 
                 for attempt in range(max_attempts):
                     try:
-                        try:
-                            count = await locator.count()
-                        except Exception as e:
-                            if self.debug:
-                                logger.debug(f"Browser {index}: Locator count failed on attempt {attempt + 1}: {str(e)}")
-                            count = 0
+                        token_elements = driver.find_elements(By.CSS_SELECTOR, 'input[name="cf-turnstile-response"]')
                         
-                        if count == 0:
+                        if not token_elements:
                             if self.debug:
                                 logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
-                        elif count == 1:
-                            try:
-                                token = await locator.input_value(timeout=500)
+                        else:
+                            for token_elem in token_elements:
+                                token = token_elem.get_attribute('value')
                                 if token:
                                     elapsed_time = round(time.time() - start_time, 3)
                                     logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
                                     await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
+                                    await self.driver_pool.put((index, driver))
                                     return
-                            except Exception as e:
-                                if self.debug:
-                                    logger.debug(f"Browser {index}: Single token element check failed: {str(e)}")
-                        else:
-                            if self.debug:
-                                logger.debug(f"Browser {index}: Found {count} token elements, checking all")
-                            
-                            for i in range(count):
-                                try:
-                                    element_token = await locator.nth(i).input_value(timeout=500)
-                                    if element_token:
-                                        elapsed_time = round(time.time() - start_time, 3)
-                                        logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                                        await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
-                                        return
-                                except Exception:
-                                    continue
                         
                         if attempt > 2 and attempt % 3 == 0:
-                            click_success = await self._try_click_strategies(page, index)
+                            click_success = await self._try_click_strategies(driver, index)
                             if not click_success and self.debug:
                                 logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1}")
                         
                         if attempt == 10:
                             try:
-                                try:
-                                    current_count = await locator.count()
-                                except Exception:
-                                    current_count = 0
-                                    
-                                if current_count == 0:
+                                if not token_elements:
                                     if self.debug:
                                         logger.debug(f"Browser {index}: Creating overlay as fallback strategy")
-                                    await self._load_captcha_overlay(page, sitekey, action or '', index)
-                                    await asyncio.sleep(2)
+                                    await self._load_captcha_overlay(driver, sitekey, action or '', index)
+                                    time.sleep(2)
                             except Exception as e:
                                 if self.debug:
                                     logger.debug(f"Browser {index}: Fallback overlay creation failed: {str(e)}")
                         
-                        wait_time = min(0.5 + (attempt * 0.05), 1.5)  # Reduced max wait
-                        await asyncio.sleep(wait_time)
+                        wait_time = min(0.5 + (attempt * 0.05), 1.5)
+                        time.sleep(wait_time)
                         
                         if self.debug and attempt % 5 == 0:
                             logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - No valid token yet")
@@ -794,37 +632,15 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
             finally:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Closing browser context and cleaning up")
-                
                 try:
-                    if context:
-                        await context.close()
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Context closed successfully")
+                    await self.driver_pool.put((index, driver))
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Driver returned to pool")
                 except Exception as e:
                     if self.debug:
-                        logger.warning(f"Browser {index}: Error closing context: {str(e)}")
-                
-                try:
-                    if hasattr(browser, 'is_connected') and browser.is_connected():
-                        await self.browser_pool.put((index, browser, browser_config))
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Browser returned to pool")
-                    else:
-                        if self.debug:
-                            logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
-                except Exception as e:
-                    if self.debug:
-                        logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
-
-
-
-
-
+                        logger.warning(f"Browser {index}: Error returning driver to pool: {str(e)}")
 
     async def process_turnstile(self):
-        """Handle the /turnstile endpoint requests."""
         url = request.args.get('url')
         sitekey = request.args.get('sitekey')
         action = request.args.get('action')
@@ -867,7 +683,6 @@ class TurnstileAPIServer:
             }), 200
 
     async def get_result(self):
-        """Return solved data"""
         task_id = request.args.get('id')
 
         if not task_id:
@@ -910,11 +725,8 @@ class TurnstileAPIServer:
                 "errorDescription": "Workers could not solve the Captcha"
             }), 200
 
-    
-
     @staticmethod
     async def index():
-        """Serve the API documentation page."""
         return """
             <!DOCTYPE html>
             <html lang="en">
@@ -927,21 +739,16 @@ class TurnstileAPIServer:
             <body class="bg-gray-900 text-gray-200 min-h-screen flex items-center justify-center">
                 <div class="bg-gray-800 p-8 rounded-lg shadow-md max-w-2xl w-full border border-red-500">
                     <h1 class="text-3xl font-bold mb-6 text-center text-red-500">Welcome to Turnstile Solver API</h1>
-
                     <p class="mb-4 text-gray-300">To use the turnstile service, send a GET request to 
                        <code class="bg-red-700 text-white px-2 py-1 rounded">/turnstile</code> with the following query parameters:</p>
-
                     <ul class="list-disc pl-6 mb-6 text-gray-300">
                         <li><strong>url</strong>: The URL where Turnstile is to be validated</li>
                         <li><strong>sitekey</strong>: The site key for Turnstile</li>
                     </ul>
-
                     <div class="bg-gray-700 p-4 rounded-lg mb-6 border border-red-500">
                         <p class="font-semibold mb-2 text-red-400">Example usage:</p>
                         <code class="text-sm break-all text-red-300">/turnstile?url=https://example.com&sitekey=sitekey</code>
                     </div>
-
-
                     <div class="bg-gray-700 p-4 rounded-lg mb-6">
                         <p class="text-gray-200 font-semibold mb-3">Deployment notes</p>
                         <div class="space-y-2 text-sm text-gray-300">
@@ -957,20 +764,18 @@ class TurnstileAPIServer:
 
 
 def parse_args():
-    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Turnstile API Server")
-
     parser.add_argument('--no-headless', action='store_true', help='Run the browser with GUI (disable headless mode). By default, headless mode is enabled.')
     parser.add_argument('--useragent', type=str, help='User-Agent string (if not specified, random configuration is used)')
     parser.add_argument('--debug', action='store_true', help='Enable or disable debug mode for additional logging and troubleshooting information (default: False)')
-    parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox (default: chromium)')
-    parser.add_argument('--thread', type=int, default=1, help='Set the number of browser threads to use (max 1 for Koyeb, default: 1)')
+    parser.add_argument('--browser_type', type=str, default='chrome', help='Browser type (default: chrome)')
+    parser.add_argument('--thread', type=int, default=1, help='Number of browser threads (default: 1)')
     parser.add_argument('--proxy', action='store_true', help='Enable proxy support for the solver (Default: False)')
-    parser.add_argument('--random', action='store_true', help='Use random User-Agent and Sec-CH-UA configuration from pool')
-    parser.add_argument('--browser', type=str, help='Specify browser name to use (e.g., chrome, firefox)')
-    parser.add_argument('--version', type=str, help='Specify browser version to use (e.g., 139, 141)')
-    parser.add_argument('--host', type=str, default='0.0.0.0', help='Specify the IP address where the API solver runs. (Default: 0.0.0.0)')
-    parser.add_argument('--port', type=str, default='5072', help='Set the port for the API solver to listen on. (Default: 5072)')
+    parser.add_argument('--random', action='store_true', help='Use random User-Agent configuration')
+    parser.add_argument('--browser', type=str, default='chrome', help='Browser name')
+    parser.add_argument('--version', type=str, default='139', help='Browser version')
+    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to run on (Default: 0.0.0.0)')
+    parser.add_argument('--port', type=str, default='5072', help='Port to run on (Default: 5072)')
     return parser.parse_args()
 
 
@@ -981,29 +786,20 @@ def create_app(headless: bool, useragent: str, debug: bool, browser_type: str, t
 
 if __name__ == '__main__':
     args = parse_args()
-    browser_types = [
-        'chromium',
-        'chrome',
-        'msedge',
-        'camoufox',
-    ]
-    if args.browser_type not in browser_types:
-        logger.error(f"Unknown browser type: {COLORS.get('RED')}{args.browser_type}{COLORS.get('RESET')} Available browser types: {browser_types}")
-    else:
-        # Force thread=1 for Koyeb
-        if args.thread > 1:
-            logger.warning(f"Thread count reduced from {args.thread} to 1 for Koyeb resource limits")
-            args.thread = 1
-            
-        app = create_app(
-            headless=not args.no_headless, 
-            debug=args.debug, 
-            useragent=args.useragent, 
-            browser_type=args.browser_type, 
-            thread=args.thread, 
-            proxy_support=args.proxy,
-            use_random_config=args.random,
-            browser_name=args.browser,
-            browser_version=args.version
-        )
-        app.run(host=args.host, port=int(args.port))
+    
+    if args.thread > 1:
+        logger.warning(f"Thread count reduced from {args.thread} to 1 for resource limits")
+        args.thread = 1
+        
+    app = create_app(
+        headless=not args.no_headless, 
+        debug=args.debug, 
+        useragent=args.useragent, 
+        browser_type="chrome", 
+        thread=args.thread, 
+        proxy_support=args.proxy,
+        use_random_config=args.random,
+        browser_name="chrome",
+        browser_version=args.version
+    )
+    app.run(host=args.host, port=int(args.port))
