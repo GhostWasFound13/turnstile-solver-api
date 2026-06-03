@@ -15,8 +15,8 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.firefox.service import Service
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -165,10 +165,10 @@ async def get_pending_count() -> int:
 # ============ BROWSER CONFIGURATION ============
 def get_random_user_agent() -> str:
     user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
     ]
     return random.choice(user_agents)
 
@@ -242,14 +242,14 @@ class TurnstileAPIServer:
     def __init__(self, headless: bool, useragent: Optional[str], debug: bool, browser_type: str, thread: int, proxy_support: bool, use_random_config: bool = False, browser_name: Optional[str] = None, browser_version: Optional[str] = None):
         self.app = Quart(__name__)
         self.debug = debug
-        self.browser_type = "chrome"
+        self.browser_type = "firefox"
         self.headless = headless
         self.thread_count = min(thread, 1)
         self.proxy_support = proxy_support
         self.driver_pool = asyncio.Queue()
         self.use_random_config = use_random_config
-        self.browser_name = browser_name or "chrome"
-        self.browser_version = browser_version or "139"
+        self.browser_name = browser_name or "firefox"
+        self.browser_version = browser_version or "120"
         self.console = Console()
         self.login_address = os.getenv("TURNSTILE_LOGIN_ADDRESS", "").strip()
         self.active_tasks = set()
@@ -263,15 +263,15 @@ class TurnstileAPIServer:
         self.console.clear()
         
         combined_text = Text()
-        combined_text.append("\nTurnstile Solver API - ChromeDriver Edition", style="bold white")
-        combined_text.append(f"\nRuntime: Quart + Selenium/ChromeDriver (Threads: {self.thread_count})", style="cyan")
+        combined_text.append("\nTurnstile Solver API - Firefox Edition", style="bold white")
+        combined_text.append(f"\nRuntime: Quart + Selenium/GeckoDriver (Threads: {self.thread_count})", style="cyan")
         combined_text.append("\nStorage: JSON (Auto-reset every 5 hours)", style="cyan")
         combined_text.append("\n")
 
         info_panel = Panel(
             Align.left(combined_text),
             title="[bold blue]Turnstile Solver API[/bold blue]",
-            subtitle="[bold magenta]ChromeDriver Only Build[/bold magenta]",
+            subtitle="[bold magenta]Firefox Only Build[/bold magenta]",
             box=box.ROUNDED,
             border_style="bright_blue",
             padding=(0, 1),
@@ -292,12 +292,12 @@ class TurnstileAPIServer:
 
     async def _startup(self) -> None:
         self.display_welcome()
-        logger.info(f"Starting ChromeDriver initialization with {self.thread_count} driver(s)")
+        logger.info(f"Starting GeckoDriver initialization with {self.thread_count} driver(s)")
         try:
             await init_db()
             await self._initialize_drivers()
         except Exception as e:
-            logger.error(f"Failed to initialize ChromeDriver: {str(e)}")
+            logger.error(f"Failed to initialize GeckoDriver: {str(e)}")
             raise
 
     async def _shutdown(self) -> None:
@@ -311,77 +311,53 @@ class TurnstileAPIServer:
         logger.info("Shutdown complete")
 
     async def _initialize_drivers(self) -> None:
-        chrome_options = Options()
-        
-        # CRITICAL FIX: Add binary location
-        possible_paths = [
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable"
-        ]
-        
-        for path in possible_paths:
-            if os.path.exists(path):
-                chrome_options.binary_location = path
-                logger.info(f"Using Chrome binary: {path}")
-                break
+        firefox_options = Options()
         
         if self.headless:
-            chrome_options.add_argument("--headless=new")
+            firefox_options.add_argument("--headless")
         
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--disable-software-rasterizer")
-        chrome_options.add_argument("--disable-background-timer-throttling")
-        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
-        chrome_options.add_argument("--disable-renderer-backgrounding")
-        chrome_options.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
-        chrome_options.add_argument("--disable-ipc-flooding-protection")
-        chrome_options.add_argument("--disable-hang-monitor")
-        chrome_options.add_argument("--disable-prompt-on-repost")
-        chrome_options.add_argument("--disable-sync")
-        chrome_options.add_argument("--disable-default-apps")
-        chrome_options.add_argument("--disable-extensions")
-        chrome_options.add_argument("--disable-plugins")
-        chrome_options.add_argument("--disable-images")
-        chrome_options.add_argument("--blink-settings=imagesEnabled=false")
-        chrome_options.add_argument("--window-size=480,200")
-        chrome_options.add_argument("--remote-debugging-port=9222")
+        firefox_options.add_argument("--no-sandbox")
+        firefox_options.add_argument("--disable-dev-shm-usage")
+        firefox_options.set_preference("dom.webdriver.enabled", False)
+        firefox_options.set_preference("useAutomationExtension", False)
+        firefox_options.set_preference("media.navigator.enabled", False)
+        firefox_options.set_preference("javascript.enabled", True)
+        firefox_options.set_preference("permissions.default.image", 2)
+        firefox_options.set_preference("dom.ipc.processCount", 1)
+        firefox_options.set_preference("browser.tabs.remote.autostart", False)
+        firefox_options.set_preference("browser.tabs.remote.autostart.2", False)
         
         if self.useragent:
-            chrome_options.add_argument(f"--user-agent={self.useragent}")
+            firefox_options.set_preference("general.useragent.override", self.useragent)
         
-        # Setup service with explicit chromedriver path
-        chromedriver_paths = [
-            "/usr/local/bin/chromedriver",
-            "/usr/bin/chromedriver",
-            "/usr/lib/chromium/chromedriver"
+        # Setup service
+        geckodriver_paths = [
+            "/usr/local/bin/geckodriver",
+            "/usr/bin/geckodriver",
+            "/snap/bin/geckodriver"
         ]
         
         service = None
-        for path in chromedriver_paths:
+        for path in geckodriver_paths:
             if os.path.exists(path):
-                logger.info(f"Using ChromeDriver: {path}")
+                logger.info(f"Using GeckoDriver: {path}")
                 service = Service(executable_path=path)
                 break
         
         if not service:
-            logger.warning("ChromeDriver not found in common paths, trying default")
             service = Service()
         
         for i in range(self.thread_count):
             try:
-                driver = webdriver.Chrome(options=chrome_options, service=service)
+                driver = webdriver.Firefox(options=firefox_options, service=service)
                 await self.driver_pool.put((i+1, driver))
                 if self.debug:
-                    logger.info(f"ChromeDriver {i + 1} initialized successfully")
+                    logger.info(f"GeckoDriver {i + 1} initialized successfully")
             except Exception as e:
-                logger.error(f"Failed to initialize ChromeDriver {i+1}: {e}")
+                logger.error(f"Failed to initialize GeckoDriver {i+1}: {e}")
                 continue
         
-        logger.info(f"ChromeDriver pool initialized with {self.driver_pool.qsize()} drivers")
+        logger.info(f"GeckoDriver pool initialized with {self.driver_pool.qsize()} drivers")
 
     async def _find_and_click_checkbox(self, driver, index: int):
         try:
@@ -781,15 +757,15 @@ class TurnstileAPIServer:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Turnstile API Server")
-    parser.add_argument('--no-headless', action='store_true', help='Run the browser with GUI (disable headless mode)')
+    parser.add_argument('--no-headless', action='store_true', help='Run the browser with GUI')
     parser.add_argument('--useragent', type=str, help='User-Agent string')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
-    parser.add_argument('--browser_type', type=str, default='chrome', help='Browser type')
+    parser.add_argument('--browser_type', type=str, default='firefox', help='Browser type')
     parser.add_argument('--thread', type=int, default=1, help='Number of browser threads')
     parser.add_argument('--proxy', action='store_true', help='Enable proxy support')
     parser.add_argument('--random', action='store_true', help='Use random User-Agent')
-    parser.add_argument('--browser', type=str, default='chrome', help='Browser name')
-    parser.add_argument('--version', type=str, default='139', help='Browser version')
+    parser.add_argument('--browser', type=str, default='firefox', help='Browser name')
+    parser.add_argument('--version', type=str, default='120', help='Browser version')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to run on')
     parser.add_argument('--port', type=str, default='8000', help='Port to run on')
     return parser.parse_args()
@@ -811,11 +787,11 @@ if __name__ == '__main__':
         headless=not args.no_headless, 
         debug=args.debug, 
         useragent=args.useragent, 
-        browser_type="chrome", 
+        browser_type="firefox", 
         thread=args.thread, 
         proxy_support=args.proxy,
         use_random_config=args.random,
-        browser_name="chrome",
+        browser_name="firefox",
         browser_version=args.version
     )
     app.run(host=args.host, port=int(args.port))
